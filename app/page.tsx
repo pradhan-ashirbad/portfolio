@@ -1,5 +1,6 @@
 import { Background } from "@/components/Background";
 import { CursorGlow } from "@/components/CursorGlow";
+import { CursorTrail } from "@/components/CursorTrail";
 import { ScrollProgress } from "@/components/ScrollProgress";
 import { Navbar } from "@/components/Navbar";
 import { Hero } from "@/components/Hero";
@@ -15,6 +16,7 @@ export default function Home() {
     <>
       <Background />
       <CursorGlow />
+      <CursorTrail />
       <ScrollProgress />
       <Navbar />
       <main>
