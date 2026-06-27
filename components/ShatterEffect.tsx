@@ -2,6 +2,18 @@
 
 import { useEffect, useRef } from "react";
 
+interface Vec {
+  x: number;
+  y: number;
+}
+
+interface Line {
+  p: Vec; // a point on the line
+  n: Vec; // unit normal
+  angle: number;
+  mid: Vec;
+}
+
 interface Crack {
   x1: number;
   y1: number;
@@ -11,13 +23,12 @@ interface Crack {
 }
 
 interface Shard {
-  local: { x: number; y: number }[]; // points relative to centroid
+  local: Vec[]; // polygon points relative to centroid
   bbox: { minX: number; minY: number; maxX: number; maxY: number };
-  cx: number; // current centroid x
-  cy: number; // current centroid y
+  cx: number;
+  cy: number;
   vx: number;
   vy: number;
-  rot: number;
   vrot: number;
   delay: number;
   r: number;
@@ -40,6 +51,56 @@ const TINTS = [
   [150, 210, 245],
   [196, 174, 246],
 ];
+
+// ---- geometry helpers (pure) ----
+const sdist = (v: Vec, L: Line) => (v.x - L.p.x) * L.n.x + (v.y - L.p.y) * L.n.y;
+
+// Clip a convex polygon to one half-plane of a line (Sutherland–Hodgman).
+const clip = (poly: Vec[], L: Line, side: number): Vec[] => {
+  const res: Vec[] = [];
+  for (let i = 0; i < poly.length; i++) {
+    const cur = poly[i];
+    const nxt = poly[(i + 1) % poly.length];
+    const dc = sdist(cur, L) * side;
+    const dn = sdist(nxt, L) * side;
+    if (dc >= 0) res.push(cur);
+    if (dc >= 0 !== dn >= 0) {
+      const t = dc / (dc - dn);
+      res.push({ x: cur.x + (nxt.x - cur.x) * t, y: cur.y + (nxt.y - cur.y) * t });
+    }
+  }
+  return res;
+};
+
+const polyArea = (poly: Vec[]) => {
+  let s = 0;
+  for (let i = 0; i < poly.length; i++) {
+    const a = poly[i];
+    const b = poly[(i + 1) % poly.length];
+    s += a.x * b.y - b.x * a.y;
+  }
+  return Math.abs(s / 2);
+};
+
+const lineFromSeg = (a: Vec, b: Vec): Line => {
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const len = Math.hypot(dx, dy) || 1;
+  return {
+    p: a,
+    n: { x: -dy / len, y: dx / len },
+    angle: Math.atan2(dy, dx),
+    mid: { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 },
+  };
+};
+
+const sameLine = (a: Line, b: Line) => {
+  let da = Math.abs(a.angle - b.angle) % Math.PI;
+  da = Math.min(da, Math.PI - da);
+  if (da > 0.22) return false; // within ~12.6°
+  const off = Math.abs((b.p.x - a.p.x) * a.n.x + (b.p.y - a.p.y) * a.n.y);
+  return off < 36; // and within 36px
+};
 
 export function ShatterEffect() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -103,82 +164,117 @@ export function ShatterEffect() {
           speedEMA > SPEED_TH &&
           dist > 4
         ) {
-          cracks.push({
-            x1: last.x,
-            y1: last.y,
-            x2: e.clientX,
-            y2: e.clientY,
-            born: now,
-          });
-          if (cracks.length > 60) cracks.shift();
+          cracks.push({ x1: last.x, y1: last.y, x2: e.clientX, y2: e.clientY, born: now });
+          if (cracks.length > 80) cracks.shift();
         }
       }
       last = { x: e.clientX, y: e.clientY, t: now };
     };
     window.addEventListener("mousemove", onMove, { passive: true });
 
-    const buildShards = () => {
+    // Build shards by slicing the viewport along the actual mouse cut paths.
+    const buildShardsFromCuts = (cuts: Crack[]) => {
       shards = [];
-      const cols = Math.max(7, Math.round(w / 150));
-      const rows = Math.max(5, Math.round(h / 150));
-      const cw = w / cols;
-      const ch = h / rows;
-      const jx = cw * 0.45;
-      const jy = ch * 0.45;
-      const pts: { x: number; y: number }[][] = [];
-      for (let r = 0; r <= rows; r++) {
-        pts[r] = [];
-        for (let c = 0; c <= cols; c++) {
-          const edge = r === 0 || c === 0 || r === rows || c === cols;
-          pts[r][c] = {
-            x: c * cw + (edge ? 0 : (Math.random() - 0.5) * jx),
-            y: r * ch + (edge ? 0 : (Math.random() - 0.5) * jy),
-          };
+
+      // 1. Primary cut lines from the user's strokes (deduped).
+      const primary: Line[] = [];
+      for (const c of cuts) {
+        if (Math.hypot(c.x2 - c.x1, c.y2 - c.y1) < 12) continue;
+        const L = lineFromSeg({ x: c.x1, y: c.y1 }, { x: c.x2, y: c.y2 });
+        if (primary.some((p) => sameLine(p, L))) continue;
+        primary.push(L);
+        if (primary.length >= 14) break;
+      }
+
+      // 2. Splinter lines clustered around each cut, so glass fractures along the path.
+      const lines: Line[] = [...primary];
+      for (const p of primary) {
+        const off = (18 + Math.random() * 42) * (Math.random() < 0.5 ? -1 : 1);
+        lines.push({
+          p: { x: p.p.x + p.n.x * off, y: p.p.y + p.n.y * off },
+          n: p.n,
+          angle: p.angle,
+          mid: p.mid,
+        });
+        const ang = p.angle + (0.14 + Math.random() * 0.32) * (Math.random() < 0.5 ? -1 : 1);
+        const dir = { x: Math.cos(ang), y: Math.sin(ang) };
+        lines.push({ p: p.mid, n: { x: -dir.y, y: dir.x }, angle: ang, mid: p.mid });
+        if (lines.length >= 32) break;
+      }
+
+      // 3. If there were barely any cuts, add a few through the cursor so it still shatters.
+      if (primary.length < 2) {
+        for (let k = 0; k < 4; k++) {
+          const ang = Math.random() * Math.PI;
+          const dir = { x: Math.cos(ang), y: Math.sin(ang) };
+          lines.push({ p: { x: originX, y: originY }, n: { x: -dir.y, y: dir.x }, angle: ang, mid: { x: originX, y: originY } });
         }
       }
-      const addTri = (
-        a: { x: number; y: number },
-        b: { x: number; y: number },
-        cc: { x: number; y: number }
-      ) => {
-        const cx = (a.x + b.x + cc.x) / 3;
-        const cy = (a.y + b.y + cc.y) / 3;
-        const local = [a, b, cc].map((p) => ({ x: p.x - cx, y: p.y - cy }));
+
+      // 4. Slice the full-screen rectangle by every line into convex pieces.
+      let polys: Vec[][] = [[
+        { x: 0, y: 0 },
+        { x: w, y: 0 },
+        { x: w, y: h },
+        { x: 0, y: h },
+      ]];
+      for (const L of lines) {
+        const out: Vec[][] = [];
+        for (const poly of polys) {
+          const pos = clip(poly, L, 1);
+          const neg = clip(poly, L, -1);
+          if (pos.length >= 3) out.push(pos);
+          if (neg.length >= 3) out.push(neg);
+        }
+        polys = out;
+        if (polys.length > 520) break;
+      }
+
+      // 5. Blast center = average of where the cuts happened.
+      let bx = 0;
+      let by = 0;
+      if (cuts.length) {
+        for (const c of cuts) {
+          bx += (c.x1 + c.x2) / 2;
+          by += (c.y1 + c.y2) / 2;
+        }
+        bx /= cuts.length;
+        by /= cuts.length;
+      } else {
+        bx = originX;
+        by = originY;
+      }
+
+      for (const poly of polys) {
+        if (polyArea(poly) < 120) continue;
+        let cx = 0;
+        let cy = 0;
+        for (const v of poly) {
+          cx += v.x;
+          cy += v.y;
+        }
+        cx /= poly.length;
+        cy /= poly.length;
+        const local = poly.map((v) => ({ x: v.x - cx, y: v.y - cy }));
         const xs = local.map((p) => p.x);
         const ys = local.map((p) => p.y);
-        const dirX = cx - originX;
-        const dirY = cy - originY;
-        const dist = Math.hypot(dirX, dirY) || 1;
+        const dx = cx - bx;
+        const dy = cy - by;
+        const dist = Math.hypot(dx, dy) || 1;
         const tint = TINTS[(Math.random() * TINTS.length) | 0];
         shards.push({
           local,
-          bbox: {
-            minX: Math.min(...xs),
-            minY: Math.min(...ys),
-            maxX: Math.max(...xs),
-            maxY: Math.max(...ys),
-          },
+          bbox: { minX: Math.min(...xs), minY: Math.min(...ys), maxX: Math.max(...xs), maxY: Math.max(...ys) },
           cx,
           cy,
-          vx: (dirX / dist) * (0.04 + Math.random() * 0.12) + (Math.random() - 0.5) * 0.05,
-          vy: -0.12 - Math.random() * 0.12, // small initial pop up before gravity
-          rot: 0,
+          vx: (dx / dist) * (0.05 + Math.random() * 0.13) + (Math.random() - 0.5) * 0.04,
+          vy: -0.05 - Math.random() * 0.12,
           vrot: (Math.random() - 0.5) * 0.006,
-          delay: Math.min(dist * 0.35, 240) + Math.random() * 60,
+          delay: Math.min(dist * 0.3, 220) + Math.random() * 50,
           r: tint[0],
           g: tint[1],
           b: tint[2],
         });
-      };
-      for (let r = 0; r < rows; r++) {
-        for (let c = 0; c < cols; c++) {
-          const p00 = pts[r][c];
-          const p10 = pts[r][c + 1];
-          const p11 = pts[r + 1][c + 1];
-          const p01 = pts[r + 1][c];
-          addTri(p00, p10, p11);
-          addTri(p00, p11, p01);
-        }
       }
     };
 
@@ -187,7 +283,8 @@ export function ShatterEffect() {
       shatterStart = performance.now();
       originX = mx || w / 2;
       originY = my || h / 2;
-      buildShards();
+      const cuts = cracks.slice();
+      buildShardsFromCuts(cuts);
       cracks = [];
       if (root) {
         root.style.transition = "opacity 0.28s ease, transform 0.1s ease, filter 0.28s ease";
@@ -233,7 +330,6 @@ export function ShatterEffect() {
     };
 
     const drawChargeHint = () => {
-      // faint pulsing vignette while charging up
       if (charge <= 0.05) return;
       const g = ctx.createRadialGradient(
         w / 2,
@@ -247,44 +343,6 @@ export function ShatterEffect() {
       g.addColorStop(1, `rgba(45,212,191,${0.18 * charge})`);
       ctx.fillStyle = g;
       ctx.fillRect(0, 0, w, h);
-    };
-
-    const drawShards = (now: number) => {
-      const t = now - shatterStart;
-
-      // initial white flash
-      if (t < 200) {
-        const fa = (1 - t / 200) * 0.5;
-        ctx.fillStyle = `rgba(235,255,252,${fa})`;
-        ctx.fillRect(0, 0, w, h);
-      }
-
-      // screen shake during early shatter
-      if (root) {
-        if (t < 320) {
-          const s = (1 - t / 320) * 9;
-          root.style.transform = `translate(${(Math.random() - 0.5) * s}px, ${(Math.random() - 0.5) * s}px)`;
-        } else {
-          root.style.transform = "none";
-        }
-      }
-
-      for (const sh of shards) {
-        const lt = t - sh.delay;
-        if (lt <= 0) {
-          // not launched yet — draw in place, full opacity
-          drawShard(sh, sh.cx, sh.cy, 0, 1);
-          continue;
-        }
-        // integrate motion (analytic so it's frame-rate independent)
-        const px = sh.cx + sh.vx * lt;
-        const py = sh.cy + sh.vy * lt + 0.5 * GRAVITY * lt * lt;
-        const rot = sh.vrot * lt;
-        const fadeStart = SHATTER_DUR * 0.55;
-        let alpha = 1;
-        if (t > fadeStart) alpha = Math.max(0, 1 - (t - fadeStart) / (SHATTER_DUR - fadeStart));
-        drawShard(sh, px, py, rot, alpha);
-      }
     };
 
     const drawShard = (sh: Shard, px: number, py: number, rot: number, alpha: number) => {
@@ -307,6 +365,40 @@ export function ShatterEffect() {
       ctx.restore();
     };
 
+    const drawShards = (now: number) => {
+      const t = now - shatterStart;
+
+      if (t < 200) {
+        const fa = (1 - t / 200) * 0.5;
+        ctx.fillStyle = `rgba(235,255,252,${fa})`;
+        ctx.fillRect(0, 0, w, h);
+      }
+
+      if (root) {
+        if (t < 320) {
+          const s = (1 - t / 320) * 9;
+          root.style.transform = `translate(${(Math.random() - 0.5) * s}px, ${(Math.random() - 0.5) * s}px)`;
+        } else {
+          root.style.transform = "none";
+        }
+      }
+
+      const fadeStart = SHATTER_DUR * 0.55;
+      for (const sh of shards) {
+        const lt = t - sh.delay;
+        if (lt <= 0) {
+          drawShard(sh, sh.cx, sh.cy, 0, 1);
+          continue;
+        }
+        const px = sh.cx + sh.vx * lt;
+        const py = sh.cy + sh.vy * lt + 0.5 * GRAVITY * lt * lt;
+        const rot = sh.vrot * lt;
+        let alpha = 1;
+        if (t > fadeStart) alpha = Math.max(0, 1 - (t - fadeStart) / (SHATTER_DUR - fadeStart));
+        drawShard(sh, px, py, rot, alpha);
+      }
+    };
+
     let raf = 0;
     let lastFrame = performance.now();
     const loop = () => {
@@ -324,11 +416,9 @@ export function ShatterEffect() {
         } else {
           charge = Math.max(0, charge - DECAY * dt);
           if (charge === 0) phase = "idle";
-          if (!slicing) speedEMA *= 0.9;
+          speedEMA *= 0.9;
         }
-        if (charge >= 1) {
-          startShatter();
-        }
+        if (charge >= 1) startShatter();
       } else if (phase === "shatter") {
         if (now - shatterStart >= SHATTER_DUR) restore();
       } else if (phase === "cooldown") {
